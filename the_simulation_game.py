@@ -12,16 +12,6 @@ import util
 
 ti.init(arch=ti.gpu)
 
-# # procedurally setting up the cantilever
-# center_x, center_y = 0.6, 0.5
-
-# N = 7
-# N_triangles = 6
-
-
-
-
-
 # deformation_gradient = ti.Matrix.field(2, 2, ti.f32, ())
 # strain_engergy = ti.field(ti.f32, ())
 
@@ -34,23 +24,21 @@ PoissonsRatio = ti.field(ti.f32, ())
 LameMu = ti.field(ti.f32, ())
 LameLa = ti.field(ti.f32, ())
 
-
-
 # time-step size (for simulation, 16.7ms)
 h = 0.8e-3
 # substepping
-substepping = 20
+substepping = 5
 # time-step size (for time integration)
 dh = h/substepping
 
-curser_radius = 0.05
+curser_radius = 0.01
 
 curser = ti.Vector.field(2, ti.f32, ())
-picking = ti.field(ti.i32,())
+editing = ti.field(ti.i32,())
 
 # rendering
-width = 1000
-height = 1000
+width = 800
+height = 800
 pixels = ti.Vector.field(3, ti.f32, shape=(width, height))
 
 # World building
@@ -65,7 +53,11 @@ N_grid_points = N_x * N_y
 
 # geometric components
 N_triangles = N_bx * N_by * 2 # 2 triangles per block
-triangles = ti.Vector.field(3, ti.i32, N_triangles)
+#triangles = ti.Vector.field(3, ti.i32, N_triangles)
+
+triangles = ti.Vector.field(3, ti.i32)
+block = ti.root.bitmasked(ti.i, N_triangles)
+block.place(triangles)
 
 
 # simulation components
@@ -81,9 +73,12 @@ elements_V0 = ti.field(ti.f32, N_triangles) # rest volume/area
 # -----------------------meshing and init----------------------------
 @ti.kernel
 def meshing():
-    building_block[5,4] = 1
-    building_block[6,4] = 1
-    building_block[6,3] = 1
+    building_block[0, height//block_size] = 0 # deactivate menu block (avoid clicking)
+    building_block[1, height//block_size] = 0 # deactivate menu block (avoid clicking)
+    building_block[2, height//block_size] = 0 # deactivate menu block (avoid clicking)
+    building_block[0, height//block_size-1] = 0 # deactivate menu block (avoid clicking)
+    building_block[1, height//block_size-1] = 0 # deactivate menu block (avoid clicking)
+    building_block[2, height//block_size-1] = 0 # deactivate menu block (avoid clicking)
     for i, j in building_block:
         if building_block[i,j] == 1:
             bl = i * N_y + j # bottom left vertex index
@@ -97,8 +92,8 @@ def meshing():
 
 @ti.kernel
 def initialize():
-    YoungsModulus[None] = 1e5
-    PoissonsRatio[None] = 0.4
+    YoungsModulus[None] = 1e6
+    PoissonsRatio[None] = 0.0
     E = YoungsModulus[None]
     nu = PoissonsRatio[None]
     LameLa[None] = E*nu / ((1+nu)*(1-2*nu))
@@ -176,11 +171,11 @@ def compute_force():
 
 @ti.kernel
 def update():
-    deformation_gradient[None] = compute_F(0)
-    strain_engergy[None] = strain_energy(0)
+    # deformation_gradient[None] = compute_F(0)
+    # strain_engergy[None] = strain_energy(0)
 
-    for i in range(N):
-        acc = -grad[i]/m #- ti.Vector([0.0, g])
+    for i in range(N_grid_points):
+        acc = -grad[i]/m  - ti.Vector([0.0, g])
         v[i] += dh*acc
         x[i] += dh*v[i]
 
@@ -189,16 +184,16 @@ def update():
         v[i] *= ti.exp(-dh*5)
 
     # mouse control
-    for i in range(N):
-        if picking[None]:      
-            r = x[i]-curser[None]
-            if r.norm() < curser_radius:
-                x[i] = curser[None]
-                v[i] = ti.Vector([0.0, 0.0])
-                pass
+    # for i in range(N_grid_points):
+    #     if picking[None]:      
+    #         r = x[i]-curser[None]
+    #         if r.norm() < curser_radius:
+    #             x[i] = curser[None]
+    #             v[i] = ti.Vector([0.0, 0.0])
+    #             pass
 
     # boundary
-    for i in range(N):
+    for i in range(N_grid_points):
         if x[i][0] <= 0 or x[i][0] >= 1:
             v[i][0] = -0.9*v[i][0]
         if x[i][1] <= 0 or x[i][1] >= 1:
@@ -221,18 +216,53 @@ class Triangle:
 
         t = 0.0
 
-        t_alpha = util.smoothstep(-0.002, 0.002, alpha)
-        t_beta = util.smoothstep(-0.002, 0.002, beta)
-        t_gamma = util.smoothstep(-0.002, 0.002, gamma)
+        t_alpha = util.smoothstep(-0.002, 0.02, alpha)
+        t_beta = util.smoothstep(-0.002, 0.02, beta)
+        t_gamma = util.smoothstep(-0.002, 0.02, gamma)
 
         t = ti.min(ti.min(t_alpha, t_beta), t_gamma)
 
         return t
+
+@ti.func
+def square(pos, center, radius, blur):
+    diff = ti.abs(pos-center)
+    r = ti.max(diff[0], diff[1])
+    t = 0.0
+    if blur > 1.0: blur = 1.0
+    if blur <= 0.0: 
+        t = 1.0-util.step(1.0, r/radius) # This will create a 1 pixel border line around the square
+    else:
+        t = util.smoothstep(1.0, 1.0-blur, r/radius)
+    return t
     
 @ti.kernel
-def render(width: ti.i32, height: ti.i32):
-    # draw something on your canvas
+def render_edit(width: ti.i32, height: ti.i32):
+    paint_color = ti.Vector([0.2, 0.2, 0.2])
+    hover_color = ti.Vector([0.4, 0.4, 0.4])
+    active_color = ti.Vector([0.93, 0.19, 0.49]) 
+    
+    block_x = curser[None][0] * width // block_size
+    block_y = curser[None][1] * height // block_size
+    for i,j in pixels:
+        current_block_x = i // block_size
+        current_block_y = j // block_size
+        if building_block[current_block_x, current_block_y]:
+            pixels[i,j] = active_color
+        elif current_block_x == block_x and current_block_y == block_y:
+            pixels[i,j] = hover_color
+        else:
+            center = ti.Vector([block_size//2, block_size//2])
+            radius = block_size//2
+            pos = ti.Vector([i % block_size, j % block_size])
+            c = square(pos, center, radius, 0.0)
+            color = paint_color*c
+            pixels[i,j] = color
+
+@ti.kernel
+def render_simulation(width: ti.i32, height: ti.i32):
     paint_color = ti.Vector([0.93, 0.19, 0.49]) 
+    # Simulation mode
     for i,j in pixels:
         coords_x = i / width
         coords_y = j / height
@@ -240,46 +270,62 @@ def render(width: ti.i32, height: ti.i32):
 
         mask = 0.0
         for  tidx in range(N_triangles):
-            t = Triangle(x[triangles[tidx][0]], x[triangles[tidx][1]], x[triangles[tidx][2]])
-            mask = ti.max(mask, t.mask(ti.Vector([coords_x, coords_y])))
+            if ti.is_active(block, tidx):
+                t = Triangle(x[triangles[tidx][0]], x[triangles[tidx][1]], x[triangles[tidx][2]])
+                mask = ti.max(mask, t.mask(ti.Vector([coords_x, coords_y])))
 
         color = paint_color*mask
 
         pixels[i,j] = color
 
-# init once and for all
-meshing()
-print(triangles)
-initialize()
-initialize_elements()
 
 window = ti.ui.Window("Title", (width, height), vsync=True)
 gui = window.get_gui()
 canvas = window.get_canvas()
 canvas.set_background_color((0, 0, 0))
-while window.running:
-    picking[None]=0
-    window.get_event()
-    if window.is_pressed(ti.ui.LMB):
-  
-        curser[None] = window.get_cursor_pos()
-        picking[None] = 1
 
-    # for i in range(substepping):
-    #     compute_force()
-    #     update()
+# mode
+editing[None] = 1
+first = 1
+while window.running:
+    window.get_event()
+    #     
+    #     picking[None] = 1
+
+
 
     # value = 0
     # color = (1.0, 1.0, 1.0)
-    # with gui.sub_window("Deformation Gradient", x=0, y=0, width=0.25, height=0.1):
-    #     gui.text(f'| {deformation_gradient[None][0,0]:.2f}  ' + f'{deformation_gradient[None][0,1]:.2f}')
-    #     gui.text(f'| {deformation_gradient[None][1,0]:.2f}  ' + f'{deformation_gradient[None][1,1]:.2f}')
+    with gui.sub_window("Menu", x=0, y=0, width=0.18, height=0.1):
+        is_clicked = gui.button("Run Simulation")
+        if is_clicked:
+            editing[None] = 0
+            first = 1
+        #gui.text(f'| {deformation_gradient[None][0,0]:.2f}  ' + f'{deformation_gradient[None][0,1]:.2f}')
+        #gui.text(f'| {deformation_gradient[None][1,0]:.2f}  ' + f'{deformation_gradient[None][1,1]:.2f}')
     
     # with gui.sub_window("Strain Energy", x=0, y=0.11, width=0.25, height=0.1):
     #     gui.text(f'{strain_engergy[None]:.2f}')
 
-    
-    render(width, height)
+    if editing[None]:
+        curser[None] = window.get_cursor_pos()
+        if window.is_pressed(ti.ui.LMB):
+            pos = window.get_cursor_pos()
+            block_x = int(pos[0] * width // block_size)
+            block_y = int(pos[1] * height // block_size)
+            building_block[block_x, block_y] = 1
+        render_edit(width, height)
+    else:
+        if first:
+            meshing()
+            initialize()
+            initialize_elements()
+            first = 0
+        for i in range(substepping):
+            compute_force()
+            update()
+        render_simulation(width, height)
+
 
     canvas.set_image(pixels)
     window.show()

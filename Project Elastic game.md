@@ -2,6 +2,7 @@ A game build with elastic technology
 1. Create world building function
 2. Add shaking ground
 3. Merge texture with deformable meshes
+4. Self collision
 
 
 # Key technique
@@ -17,3 +18,4 @@ A game build with elastic technology
 
 
 # Findings
+1. forget to add self collision
