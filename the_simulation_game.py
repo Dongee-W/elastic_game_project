@@ -12,24 +12,18 @@ import util
 
 ti.init(arch=ti.gpu)
 
-# procedurally setting up the cantilever
-center_x, center_y = 0.6, 0.5
+# # procedurally setting up the cantilever
+# center_x, center_y = 0.6, 0.5
 
-N = 7
-N_triangles = 6
-
-
-# simulation components
-x = ti.Vector.field(2, ti.f32, N, needs_grad=True)
-v = ti.Vector.field(2, ti.f32, N)
-total_energy = ti.field(ti.f32, (), needs_grad=True)
-grad = ti.Vector.field(2, ti.f32, N)  # force on vertices
-elements_Dm_inv = ti.Matrix.field(2, 2, ti.f32, N_triangles)
-elements_V0 = ti.field(ti.f32, N_triangles) # rest volume/area
+# N = 7
+# N_triangles = 6
 
 
-deformation_gradient = ti.Matrix.field(2, 2, ti.f32, ())
-strain_engergy = ti.field(ti.f32, ())
+
+
+
+# deformation_gradient = ti.Matrix.field(2, 2, ti.f32, ())
+# strain_engergy = ti.field(ti.f32, ())
 
 
 # physical quantities
@@ -40,8 +34,7 @@ PoissonsRatio = ti.field(ti.f32, ())
 LameMu = ti.field(ti.f32, ())
 LameLa = ti.field(ti.f32, ())
 
-# geometric components
-triangles = ti.Vector.field(3, ti.i32, N_triangles)
+
 
 # time-step size (for simulation, 16.7ms)
 h = 0.8e-3
@@ -56,34 +49,63 @@ curser = ti.Vector.field(2, ti.f32, ())
 picking = ti.field(ti.i32,())
 
 # rendering
-width = 800
-height = 800
+width = 1000
+height = 1000
 pixels = ti.Vector.field(3, ti.f32, shape=(width, height))
 
+# World building
+block_size = 50 # 50*50 block dimension
+N_bx = width // block_size
+N_by = height // block_size
+building_block = ti.field(ti.i32, shape=(N_bx, N_by))
+
+N_x = N_bx + 1 # Number of block in x-axis
+N_y = N_by + 1 # Number of block in y-axis
+N_grid_points = N_x * N_y
+
+# geometric components
+N_triangles = N_bx * N_by * 2 # 2 triangles per block
+triangles = ti.Vector.field(3, ti.i32, N_triangles)
+
+
+# simulation components
+x = ti.Vector.field(2, ti.f32, N_grid_points)
+v = ti.Vector.field(2, ti.f32, N_grid_points)
+total_energy = ti.field(ti.f32, ())
+grad = ti.Vector.field(2, ti.f32, N_grid_points)  # force on vertices
+elements_Dm_inv = ti.Matrix.field(2, 2, ti.f32, N_triangles)
+elements_V0 = ti.field(ti.f32, N_triangles) # rest volume/area
 
 
 
 # -----------------------meshing and init----------------------------
 @ti.kernel
 def meshing():
-    for i in range(N_triangles):
-        triangles[i] = ti.Vector([6, i, (i+1)%N_triangles])
-
+    building_block[5,4] = 1
+    building_block[6,4] = 1
+    building_block[6,3] = 1
+    for i, j in building_block:
+        if building_block[i,j] == 1:
+            bl = i * N_y + j # bottom left vertex index
+            br = (i+1) * N_y + j # bottom right vertex index
+            tl = i * N_y + (j+1) # top left vertex index
+            tr = (i+1) * N_y + (j+1) # top right vertex index
+            triangles[2*(i*N_by+j)] = ti.Vector([bl, br, tl])
+            triangles[2*(i*N_by+j)+1] = ti.Vector([tl, br, tr])
+    
 
 
 @ti.kernel
 def initialize():
     YoungsModulus[None] = 1e5
-    PoissonsRatio[None] = 0.2
+    PoissonsRatio[None] = 0.4
     E = YoungsModulus[None]
     nu = PoissonsRatio[None]
     LameLa[None] = E*nu / ((1+nu)*(1-2*nu))
     LameMu[None] = E / (2*(1+nu))
-    for i in range(N_triangles):
-        x[i] = ti.Vector([center_x + 0.2*ti.cos(i*math.pi*2/6), center_y + 0.2*ti.sin(i*math.pi*2/6)])
-        v[i] = ti.Vector([0.0, 0.0])
-    x[6] = ti.Vector([center_x, center_y])
-    v[6] = ti.Vector([0.0, 0.0])
+    for i, j in ti.ndrange(N_x, N_y):
+        x[i*N_y+j] = ti.Vector([block_size * i / width, block_size * j / height])
+        v[i*N_y+j] = ti.Vector([0.0, 0.0])
 
 @ti.func
 def compute_R_2D(F):
@@ -171,7 +193,6 @@ def update():
         if picking[None]:      
             r = x[i]-curser[None]
             if r.norm() < curser_radius:
-                
                 x[i] = curser[None]
                 v[i] = ti.Vector([0.0, 0.0])
                 pass
@@ -228,10 +249,11 @@ def render(width: ti.i32, height: ti.i32):
 
 # init once and for all
 meshing()
+print(triangles)
 initialize()
 initialize_elements()
 
-window = ti.ui.Window("Title", (800, 800), vsync=True)
+window = ti.ui.Window("Title", (width, height), vsync=True)
 gui = window.get_gui()
 canvas = window.get_canvas()
 canvas.set_background_color((0, 0, 0))
@@ -243,18 +265,18 @@ while window.running:
         curser[None] = window.get_cursor_pos()
         picking[None] = 1
 
-    for i in range(substepping):
-        compute_force()
-        update()
+    # for i in range(substepping):
+    #     compute_force()
+    #     update()
 
-    value = 0
-    color = (1.0, 1.0, 1.0)
-    with gui.sub_window("Deformation Gradient", x=0, y=0, width=0.25, height=0.1):
-        gui.text(f'| {deformation_gradient[None][0,0]:.2f}  ' + f'{deformation_gradient[None][0,1]:.2f}')
-        gui.text(f'| {deformation_gradient[None][1,0]:.2f}  ' + f'{deformation_gradient[None][1,1]:.2f}')
+    # value = 0
+    # color = (1.0, 1.0, 1.0)
+    # with gui.sub_window("Deformation Gradient", x=0, y=0, width=0.25, height=0.1):
+    #     gui.text(f'| {deformation_gradient[None][0,0]:.2f}  ' + f'{deformation_gradient[None][0,1]:.2f}')
+    #     gui.text(f'| {deformation_gradient[None][1,0]:.2f}  ' + f'{deformation_gradient[None][1,1]:.2f}')
     
-    with gui.sub_window("Strain Energy", x=0, y=0.11, width=0.25, height=0.1):
-        gui.text(f'{strain_engergy[None]:.2f}')
+    # with gui.sub_window("Strain Energy", x=0, y=0.11, width=0.25, height=0.1):
+    #     gui.text(f'{strain_engergy[None]:.2f}')
 
     
     render(width, height)
