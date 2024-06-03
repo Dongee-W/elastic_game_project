@@ -9,5 +9,12 @@ def smoothstep(edge1, edge2, v):
     return (3-2 * t) * t**2
 
 @ti.func
+def step(edge, v):
+    ret = 0.0
+    if (v < edge): ret = 0.0
+    else: ret = 1.0
+    return ret
+
+@ti.func
 def clamp(v, v_min, v_max):
     return ti.min(ti.max(v, v_min), v_max)

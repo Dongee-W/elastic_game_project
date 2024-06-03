@@ -9,6 +9,7 @@ import taichi as ti
 import math
 
 import util
+import colorscale
 
 ti.init(arch=ti.gpu)
 
@@ -18,7 +19,7 @@ ti.init(arch=ti.gpu)
 
 # physical quantities
 m = 1
-g = 9.8
+g = 19.8
 YoungsModulus = ti.field(ti.f32, ())
 PoissonsRatio = ti.field(ti.f32, ())
 LameMu = ti.field(ti.f32, ())
@@ -59,6 +60,8 @@ triangles = ti.Vector.field(3, ti.i32)
 block = ti.root.bitmasked(ti.i, N_triangles)
 block.place(triangles)
 
+cmap = colorscale.Colormaps()
+
 
 # simulation components
 x = ti.Vector.field(2, ti.f32, N_grid_points)
@@ -67,18 +70,31 @@ total_energy = ti.field(ti.f32, ())
 grad = ti.Vector.field(2, ti.f32, N_grid_points)  # force on vertices
 elements_Dm_inv = ti.Matrix.field(2, 2, ti.f32, N_triangles)
 elements_V0 = ti.field(ti.f32, N_triangles) # rest volume/area
+strain_energy = ti.field(ti.f32, N_triangles)
 
+YoungsModulus[None] = 1e6
+PoissonsRatio[None] = 0.0
+E = YoungsModulus[None]
+nu = PoissonsRatio[None]
+LameLa[None] = E*nu / ((1+nu)*(1-2*nu))
+LameMu[None] = E / (2*(1+nu))
+
+# Mass
+mass_center = (0.5, 0.7)
+radius = 0.1
+mass_pos = ti.Vector.field(2, ti.f32, ())
 
 
 # -----------------------meshing and init----------------------------
 @ti.kernel
 def meshing():
-    building_block[0, height//block_size] = 0 # deactivate menu block (avoid clicking)
-    building_block[1, height//block_size] = 0 # deactivate menu block (avoid clicking)
-    building_block[2, height//block_size] = 0 # deactivate menu block (avoid clicking)
-    building_block[0, height//block_size-1] = 0 # deactivate menu block (avoid clicking)
-    building_block[1, height//block_size-1] = 0 # deactivate menu block (avoid clicking)
-    building_block[2, height//block_size-1] = 0 # deactivate menu block (avoid clicking)
+
+    building_block[0, height//block_size -1] = 0 # deactivate menu block (avoid clicking)
+    building_block[1, height//block_size -1] = 0 # deactivate menu block (avoid clicking)
+    building_block[2, height//block_size -1] = 0 # deactivate menu block (avoid clicking)
+    building_block[0, (height//block_size)-2] = 0 # deactivate menu block (avoid clicking)
+    building_block[1, (height//block_size)-2] = 0 # deactivate menu block (avoid clicking)
+    building_block[2, (height//block_size)-2] = 0 # deactivate menu block (avoid clicking)
     for i, j in building_block:
         if building_block[i,j] == 1:
             bl = i * N_y + j # bottom left vertex index
@@ -87,17 +103,15 @@ def meshing():
             tr = (i+1) * N_y + (j+1) # top right vertex index
             triangles[2*(i*N_by+j)] = ti.Vector([bl, br, tl])
             triangles[2*(i*N_by+j)+1] = ti.Vector([tl, br, tr])
-    
+
+@ti.kernel 
+def reset():
+    for i, j in building_block:
+        building_block[i,j] = 0
 
 
 @ti.kernel
 def initialize():
-    YoungsModulus[None] = 1e6
-    PoissonsRatio[None] = 0.0
-    E = YoungsModulus[None]
-    nu = PoissonsRatio[None]
-    LameLa[None] = E*nu / ((1+nu)*(1-2*nu))
-    LameMu[None] = E / (2*(1+nu))
     for i, j in ti.ndrange(N_x, N_y):
         x[i*N_y+j] = ti.Vector([block_size * i / width, block_size * j / height])
         v[i*N_y+j] = ti.Vector([0.0, 0.0])
@@ -120,7 +134,7 @@ def initialize_elements():
         Dm = compute_D(i)
         elements_Dm_inv[i] = Dm.inverse()
         elements_V0[i] = ti.abs(Dm.determinant())/2
-
+        strain_energy[i] = 0.0
 
 @ti.func
 def compute_F(i):
@@ -135,16 +149,16 @@ def frobenius_norm(M):
         acc += M[i,j] ** 2
     return ti.sqrt(acc)
 
-@ti.func
-def strain_energy(i):
-    Ds = compute_D(i)
-    F = Ds@elements_Dm_inv[i] # Equation (4.5)
+# @ti.func
+# def strain_energy(i):
+#     Ds = compute_D(i)
+#     F = Ds@elements_Dm_inv[i] # Equation (4.5)
 
-    R, S = compute_R_2D(F)
-    Eye = ti.Matrix.cols([[1.0, 0.0], [0.0, 1.0]])
-    Phi = LameMu[None]* frobenius_norm(F-R) +  LameLa[None]/2 * (((R.transpose())@F-Eye).trace())**2 # Equation (3.4)
-    energy = elements_V0[i] * Phi # Equation (4.6)
-    return energy
+#     R, S = compute_R_2D(F)
+#     Eye = ti.Matrix.cols([[1.0, 0.0], [0.0, 1.0]])
+#     Phi = LameMu[None]* frobenius_norm(F-R) +  LameLa[None]/2 * (((R.transpose())@F-Eye).trace())**2 # Equation (3.4)
+#     energy = elements_V0[i] * Phi # Equation (4.6)
+#     return energy
 
 @ti.kernel
 def compute_force():
@@ -152,25 +166,31 @@ def compute_force():
         grad[i] = ti.Vector([0, 0])
     # gradient of elastic potential
     for i in range(N_triangles):
-        Ds = compute_D(i)
-        F = Ds@elements_Dm_inv[i]
-        # co-rotated linear elasticity FEM part 1, page 19
-        R, S = compute_R_2D(F)
-        Eye = ti.Matrix.cols([[1.0, 0.0], [0.0, 1.0]])
-        # first Piola-Kirchhoff tensor
-        P = 2*LameMu[None]*(F-R) + LameLa[None]*((R.transpose())@F-Eye).trace()*R
-        #assemble to gradient
-        H = elements_V0[i] * P @ (elements_Dm_inv[i].transpose()) # Equation (4.7)
-        a,b,c = triangles[i][0],triangles[i][1],triangles[i][2]
-        gb = ti.Vector([H[0,0], H[1, 0]])
-        gc = ti.Vector([H[0,1], H[1, 1]])
-        ga = -gb-gc
-        grad[a] += ga
-        grad[b] += gb
-        grad[c] += gc   
+        if ti.is_active(block, i):
+            Ds = compute_D(i)
+            F = Ds@elements_Dm_inv[i]
+            # co-rotated linear elasticity FEM part 1, page 19
+            R, S = compute_R_2D(F)
+            Eye = ti.Matrix.cols([[1.0, 0.0], [0.0, 1.0]])
+
+            # Calculatie strain energy
+            Phi = LameMu[None]* frobenius_norm(F-R) +  LameLa[None]/2 * (((R.transpose())@F-Eye).trace())**2 # Equation (3.4)
+            energy = elements_V0[i] * Phi # Equation (4.6)
+            strain_energy[i] = energy
+            # first Piola-Kirchhoff tensor
+            P = 2*LameMu[None]*(F-R) + LameLa[None]*((R.transpose())@F-Eye).trace()*R
+            #assemble to gradient
+            H = elements_V0[i] * P @ (elements_Dm_inv[i].transpose()) # Equation (4.7)
+            a,b,c = triangles[i][0],triangles[i][1],triangles[i][2]
+            gb = ti.Vector([H[0,0], H[1, 0]])
+            gc = ti.Vector([H[0,1], H[1, 1]])
+            ga = -gb-gc
+            grad[a] += ga
+            grad[b] += gb
+            grad[c] += gc   
 
 @ti.kernel
-def update():
+def update(t: ti.f32):
     # deformation_gradient[None] = compute_F(0)
     # strain_engergy[None] = strain_energy(0)
 
@@ -192,12 +212,32 @@ def update():
     #             v[i] = ti.Vector([0.0, 0.0])
     #             pass
 
+
     # boundary
-    for i in range(N_grid_points):
-        if x[i][0] <= 0 or x[i][0] >= 1:
-            v[i][0] = -0.9*v[i][0]
-        if x[i][1] <= 0 or x[i][1] >= 1:
-            v[i][1] = -0.9*v[i][1]
+    for i in range(N_x):
+        x[i*N_y] = ti.Vector([block_size * i / width, 0]) + \
+            0.2 * ti.min(t, 0.5) * ti.Vector([ti.sin(15*t), 0])
+
+    #for i in range(N_grid_points):
+        # for j in range(N_triangles):
+        #     if ti.is_active(block, j):
+        #         t = Triangle(x[triangles[j][0]], x[triangles[j][1]], x[triangles[j][2]])
+        #         coli = t.collision(x[i])
+        #         if coli[0] > 0.95:
+        #             v[i] = 0.9 * ti.abs(ti.math.dot(v[i], coli[1])) * coli[1]
+
+        # if x[i][0] <= 0 :
+        #     v[i][0] = -0.9*v[i][0]
+        #     x[i][0] = 0
+        # elif x[i][0] >= 1:
+        #     v[i][0] = -0.9*v[i][0]
+        #     x[i][0] = 1
+        # if x[i][1] <= 0:
+        #     v[i][1] = -0.9*v[i][1]
+        #     x[i][1] = 0
+        # elif x[i][1] >= 1:
+        #     v[i][1] = -0.9*v[i][1]
+        #     x[i][1] = 1
 
 # -------------------- triangle rendering -----------------------
 @ti.dataclass
@@ -223,6 +263,28 @@ class Triangle:
         t = ti.min(ti.min(t_alpha, t_beta), t_gamma)
 
         return t
+
+    @ ti.func
+    def collision(self, p):
+        alpha = ((self.p2.y - self.p3.y)*(p.x - self.p3.x) + (self.p3.x - self.p2.x)*(p.y - self.p3.y)) / \
+            ((self.p2.y - self.p3.y)*(self.p1.x - self.p3.x) + (self.p3.x - self.p2.x)*(self.p1.y - self.p3.y))
+        beta = ((self.p3.y - self.p1.y)*(p.x - self.p3.x) + (self.p1.x - self.p3.x)*(p.y - self.p3.y)) / \
+            ((self.p2.y - self.p3.y)*(self.p1.x - self.p3.x) + (self.p3.x - self.p2.x)*(self.p1.y - self.p3.y))
+        gamma = 1.0 - alpha - beta
+
+        t = 0.0
+
+        t_alpha = util.smoothstep(-0.02, 0.02, alpha)
+        t_beta = util.smoothstep(-0.02, 0.02, beta)
+        t_gamma = util.smoothstep(-0.02, 0.02, gamma)
+
+        t = ti.min(ti.min(t_alpha, t_beta), t_gamma)
+
+        center = (self.p1 + self.p2 + self.p3) / 3
+        n = (p - center) / (p - center).norm()
+
+        return t, n
+    
 
 @ti.func
 def square(pos, center, radius, blur):
@@ -261,22 +323,23 @@ def render_edit(width: ti.i32, height: ti.i32):
 
 @ti.kernel
 def render_simulation(width: ti.i32, height: ti.i32):
-    paint_color = ti.Vector([0.93, 0.19, 0.49]) 
+    #paint_color = ti.Vector([0.93, 0.19, 0.49]) 
     # Simulation mode
     for i,j in pixels:
         coords_x = i / width
         coords_y = j / height
-        color = ti.Vector([0.0, 0.0, 0.0]) # init your canvas to black
+        #mask = 0.0
+        pixels[i,j] = ti.Vector([0.0, 0.0, 0.0]) # init your canvas to black
 
-        mask = 0.0
-        for  tidx in range(N_triangles):
+        #rgb = ti.Vector([0.5, 0.5, 0.5])
+        for tidx in range(N_triangles):
             if ti.is_active(block, tidx):
                 t = Triangle(x[triangles[tidx][0]], x[triangles[tidx][1]], x[triangles[tidx][2]])
-                mask = ti.max(mask, t.mask(ti.Vector([coords_x, coords_y])))
-
-        color = paint_color*mask
-
-        pixels[i,j] = color
+                #mask = ti.max(mask, t.mask(ti.Vector([coords_x, coords_y])))
+                mask = t.mask(ti.Vector([coords_x, coords_y]))
+                rgb = cmap.getcolor(util.clamp(strain_energy[tidx]/40.0, 0.0 , 1.0))
+                color = rgb*mask
+                pixels[i,j] += color
 
 
 window = ti.ui.Window("Title", (width, height), vsync=True)
@@ -297,10 +360,15 @@ while window.running:
     # value = 0
     # color = (1.0, 1.0, 1.0)
     with gui.sub_window("Menu", x=0, y=0, width=0.18, height=0.1):
-        is_clicked = gui.button("Run Simulation")
-        if is_clicked:
+        is_clicked_1 = gui.button("Run Simulation")
+        is_clicked_2 = gui.button("Reset")
+        if is_clicked_1:
             editing[None] = 0
             first = 1
+        if is_clicked_2:
+            reset()
+            block.deactivate_all()
+            editing[None] = 1
         #gui.text(f'| {deformation_gradient[None][0,0]:.2f}  ' + f'{deformation_gradient[None][0,1]:.2f}')
         #gui.text(f'| {deformation_gradient[None][1,0]:.2f}  ' + f'{deformation_gradient[None][1,1]:.2f}')
     
@@ -321,9 +389,11 @@ while window.running:
             initialize()
             initialize_elements()
             first = 0
+            time = 0.0
         for i in range(substepping):
             compute_force()
-            update()
+            time += dh
+            update(time)
         render_simulation(width, height)
 
 
