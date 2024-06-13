@@ -70,7 +70,10 @@ total_energy = ti.field(ti.f32, ())
 grad = ti.Vector.field(2, ti.f32, N_grid_points)  # force on vertices
 elements_Dm_inv = ti.Matrix.field(2, 2, ti.f32, N_triangles)
 elements_V0 = ti.field(ti.f32, N_triangles) # rest volume/area
+
 strain_energy = ti.field(ti.f32, N_triangles)
+strain_sum = ti.field(ti.f32, ()) # the sum of all strain energy
+strain_max = ti.field(ti.f32, ()) # the max of all strain energy
 
 YoungsModulus[None] = 1e6
 PoissonsRatio[None] = 0.0
@@ -135,6 +138,8 @@ def initialize_elements():
         elements_Dm_inv[i] = Dm.inverse()
         elements_V0[i] = ti.abs(Dm.determinant())/2
         strain_energy[i] = 0.0
+        strain_sum[None] = 0.0
+        strain_sum[None] = 0.0
 
 @ti.func
 def compute_F(i):
@@ -188,6 +193,14 @@ def compute_force():
             grad[a] += ga
             grad[b] += gb
             grad[c] += gc   
+    
+    # statistics
+    strain_sum[None] = 0.0
+    strain_max[None] = 0.0
+    for i in range(N_triangles):
+        strain_sum[None] += strain_energy[i]
+        if strain_max[None] < strain_energy[i]:
+            strain_max[None] = strain_energy[i]
 
 @ti.kernel
 def update(t: ti.f32):
@@ -352,13 +365,6 @@ editing[None] = 1
 first = 1
 while window.running:
     window.get_event()
-    #     
-    #     picking[None] = 1
-
-
-
-    # value = 0
-    # color = (1.0, 1.0, 1.0)
     with gui.sub_window("Menu", x=0, y=0, width=0.18, height=0.1):
         is_clicked_1 = gui.button("Run Simulation")
         is_clicked_2 = gui.button("Reset")
@@ -369,11 +375,10 @@ while window.running:
             reset()
             block.deactivate_all()
             editing[None] = 1
-        #gui.text(f'| {deformation_gradient[None][0,0]:.2f}  ' + f'{deformation_gradient[None][0,1]:.2f}')
-        #gui.text(f'| {deformation_gradient[None][1,0]:.2f}  ' + f'{deformation_gradient[None][1,1]:.2f}')
-    
-    # with gui.sub_window("Strain Energy", x=0, y=0.11, width=0.25, height=0.1):
-    #     gui.text(f'{strain_engergy[None]:.2f}')
+
+    with gui.sub_window("Stats", x=0, y=0.11, width=0.18, height=0.1):
+        gui.text(f'Total Energy: {strain_sum[None]:.2f}')
+        gui.text(f'Max Energy: {strain_max[None]:.2f}')
 
     if editing[None]:
         curser[None] = window.get_cursor_pos()
