@@ -28,7 +28,7 @@ LameLa = ti.field(ti.f32, ())
 # time-step size (for simulation, 16.7ms)
 h = 0.8e-3
 # substepping
-substepping = 5
+substepping = 20
 # time-step size (for time integration)
 dh = h/substepping
 
@@ -50,10 +50,10 @@ building_block = ti.field(ti.i32, shape=(N_bx, N_by))
 
 N_x = N_bx + 1 # Number of block in x-axis
 N_y = N_by + 1 # Number of block in y-axis
-N_grid_points = N_x * N_y
+N_grid_points = N_x * N_y + N_bx * N_by
 
 # geometric components
-N_triangles = N_bx * N_by * 2 # 2 triangles per block
+N_triangles = N_bx * N_by * 4 # 4 triangles per block
 #triangles = ti.Vector.field(3, ti.i32, N_triangles)
 
 triangles = ti.Vector.field(3, ti.i32)
@@ -98,14 +98,18 @@ def meshing():
     building_block[0, (height//block_size)-2] = 0 # deactivate menu block (avoid clicking)
     building_block[1, (height//block_size)-2] = 0 # deactivate menu block (avoid clicking)
     building_block[2, (height//block_size)-2] = 0 # deactivate menu block (avoid clicking)
+    offset = N_x * N_y
     for i, j in building_block:
         if building_block[i,j] == 1:
             bl = i * N_y + j # bottom left vertex index
             br = (i+1) * N_y + j # bottom right vertex index
             tl = i * N_y + (j+1) # top left vertex index
             tr = (i+1) * N_y + (j+1) # top right vertex index
-            triangles[2*(i*N_by+j)] = ti.Vector([bl, br, tl])
-            triangles[2*(i*N_by+j)+1] = ti.Vector([tl, br, tr])
+            center = offset + i * N_by + j
+            triangles[4*(i*N_by+j)] = ti.Vector([bl, br, center])
+            triangles[4*(i*N_by+j)+1] = ti.Vector([tl, bl, center])
+            triangles[4*(i*N_by+j)+2] = ti.Vector([tl, tr, center])
+            triangles[4*(i*N_by+j)+3] = ti.Vector([br, tr, center])
 
 @ti.kernel 
 def reset():
@@ -118,6 +122,10 @@ def initialize():
     for i, j in ti.ndrange(N_x, N_y):
         x[i*N_y+j] = ti.Vector([block_size * i / width, block_size * j / height])
         v[i*N_y+j] = ti.Vector([0.0, 0.0])
+    offset = N_x * N_y
+    for i, j in ti.ndrange(N_bx, N_by):
+        x[offset + i*N_by+j] = ti.Vector([(block_size * i  + block_size/2) / width, (block_size * j + block_size/2) / height ])
+        v[offset + i*N_by+j] = ti.Vector([0.0, 0.0])
 
 @ti.func
 def compute_R_2D(F):
@@ -192,15 +200,34 @@ def compute_force():
             ga = -gb-gc
             grad[a] += ga
             grad[b] += gb
-            grad[c] += gc   
+            grad[c] += gc
+
+    # collision
+    for i in range(N_triangles):
+        for j in range(N_triangles):
+            if ti.is_active(block, i) and ti.is_active(block, j):
+                for k in range(3):
+                    tri1 = Triangle(x[triangles[j][0]], x[triangles[j][1]], x[triangles[j][2]])
+                    coli = tri1.collision(x[triangles[i][k]])
+                    
+                    if coli[0] > 0.000:
+                        tri2 = Triangle(x[triangles[i][0]], x[triangles[i][1]], x[triangles[i][2]])
+                        grad[triangles[i][0]] += -3e4 * (tri2.center() - tri1.center()) * ti.sqrt(coli[0])
+                        grad[triangles[i][1]] += -3e4 * (tri2.center() - tri1.center()) * ti.sqrt(coli[0])
+                        grad[triangles[i][2]] += -3e4 * (tri2.center() - tri1.center()) * ti.sqrt(coli[0])
+                        grad[triangles[j][0]] += -3e4 * (tri1.center() - tri2.center()) * ti.sqrt(coli[0])
+                        grad[triangles[j][1]] += -3e4 * (tri1.center() - tri2.center()) * ti.sqrt(coli[0])
+                        grad[triangles[j][2]] += -3e4 * (tri1.center() - tri2.center()) * ti.sqrt(coli[0])
     
     # statistics
-    strain_sum[None] = 0.0
     strain_max[None] = 0.0
     for i in range(N_triangles):
-        strain_sum[None] += strain_energy[i]
+
         if strain_max[None] < strain_energy[i]:
             strain_max[None] = strain_energy[i]
+        # record all max
+        if strain_sum[None] < strain_max[None]:
+            strain_sum[None] = strain_max[None]
 
 @ti.kernel
 def update(t: ti.f32):
@@ -229,15 +256,17 @@ def update(t: ti.f32):
     # boundary
     for i in range(N_x):
         x[i*N_y] = ti.Vector([block_size * i / width, 0]) + \
-            0.2 * ti.min(t, 0.5) * ti.Vector([ti.sin(15*t), 0])
+                    0.1 * ti.min(t, 0.5) * ti.Vector([ti.sin(15*t), 0.1*ti.sin(5*t)]) + \
+                    0.1 * ti.min(t, 0.5) * ti.Vector([ti.sin(23*t), 0.1*ti.sin(4*t)])
 
-    #for i in range(N_grid_points):
-        # for j in range(N_triangles):
-        #     if ti.is_active(block, j):
-        #         t = Triangle(x[triangles[j][0]], x[triangles[j][1]], x[triangles[j][2]])
-        #         coli = t.collision(x[i])
-        #         if coli[0] > 0.95:
-        #             v[i] = 0.9 * ti.abs(ti.math.dot(v[i], coli[1])) * coli[1]
+
+    # for i in range(N_grid_points):
+    #     for j in range(N_triangles):
+    #         if ti.is_active(block, j):
+    #             tri = Triangle(x[triangles[j][0]], x[triangles[j][1]], x[triangles[j][2]])
+    #             coli = tri.collision(x[i])
+    #             if coli[0] >= 0.9:
+    #                 v[i] = 1.0 * ti.abs(ti.math.dot(v[i], coli[1])) * coli[1]
 
         # if x[i][0] <= 0 :
         #     v[i][0] = -0.9*v[i][0]
@@ -258,6 +287,10 @@ class Triangle:
     p1: ti.math.vec2
     p2: ti.math.vec2
     p3: ti.math.vec2
+
+    @ ti.func
+    def center(self):
+        return (self.p1 + self.p2 + self.p3) / 3
 
     @ ti.func
     def mask(self, p):
@@ -285,11 +318,11 @@ class Triangle:
             ((self.p2.y - self.p3.y)*(self.p1.x - self.p3.x) + (self.p3.x - self.p2.x)*(self.p1.y - self.p3.y))
         gamma = 1.0 - alpha - beta
 
-        t = 0.0
+        t = -1000.0
 
-        t_alpha = util.smoothstep(-0.02, 0.02, alpha)
-        t_beta = util.smoothstep(-0.02, 0.02, beta)
-        t_gamma = util.smoothstep(-0.02, 0.02, gamma)
+        t_alpha = util.smoothstep(0.02, 0.1, alpha)
+        t_beta = util.smoothstep(0.02, 0.1, beta)
+        t_gamma = util.smoothstep(0.02, 0.1, gamma)
 
         t = ti.min(ti.min(t_alpha, t_beta), t_gamma)
 
@@ -377,8 +410,8 @@ while window.running:
             editing[None] = 1
 
     with gui.sub_window("Stats", x=0, y=0.11, width=0.18, height=0.1):
-        gui.text(f'Total Energy: {strain_sum[None]:.2f}')
-        gui.text(f'Max Energy: {strain_max[None]:.2f}')
+        gui.text(f'Max Energy: {strain_sum[None]:.2f}')
+        gui.text(f'Current Energy: {strain_max[None]:.2f}')
 
     if editing[None]:
         curser[None] = window.get_cursor_pos()
@@ -396,11 +429,14 @@ while window.running:
             first = 0
             time = 0.0
         for i in range(substepping):
-            compute_force()
-            time += dh
-            update(time)
+            if time < 1.5:
+                compute_force()
+                time += dh
+                update(time)
         render_simulation(width, height)
-
+        if time > 1.5:
+            with gui.sub_window("Final", x=0, y=0.11, width=0.18, height=0.1):
+                gui.text(f'Max Energy: {strain_sum[None]:.2f}')
 
     canvas.set_image(pixels)
     window.show()
