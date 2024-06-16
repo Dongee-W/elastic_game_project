@@ -256,8 +256,9 @@ def update(t: ti.f32):
     # boundary
     for i in range(N_x):
         x[i*N_y] = ti.Vector([block_size * i / width, 0]) + \
-                    0.1 * ti.min(t, 0.5) * ti.Vector([ti.sin(15*t), 0.1*ti.sin(5*t)]) + \
-                    0.1 * ti.min(t, 0.5) * ti.Vector([ti.sin(23*t), 0.1*ti.sin(4*t)])
+                    0.1 * ti.min(t, 0.5) * ti.Vector([ti.sin(15*t), 0.2*ti.sin(5*t)]) + \
+                    0.1 * ti.min(t, 0.5) * ti.Vector([ti.sin(23*t), 0.2*ti.sin(4*t)]) + \
+                    0.1 * ti.min(t, 0.5) * ti.Vector([ti.cos(31*t), 0.2*ti.sin(9*t)])
 
 
     # for i in range(N_grid_points):
@@ -289,10 +290,6 @@ class Triangle:
     p3: ti.math.vec2
 
     @ ti.func
-    def center(self):
-        return (self.p1 + self.p2 + self.p3) / 3
-
-    @ ti.func
     def mask(self, p):
         alpha = ((self.p2.y - self.p3.y)*(p.x - self.p3.x) + (self.p3.x - self.p2.x)*(p.y - self.p3.y)) / \
             ((self.p2.y - self.p3.y)*(self.p1.x - self.p3.x) + (self.p3.x - self.p2.x)*(self.p1.y - self.p3.y))
@@ -309,6 +306,12 @@ class Triangle:
         t = ti.min(ti.min(t_alpha, t_beta), t_gamma)
 
         return t
+
+    
+    @ ti.func
+    def center(self):
+        return (self.p1 + self.p2 + self.p3) / 3
+
 
     @ ti.func
     def collision(self, p):
